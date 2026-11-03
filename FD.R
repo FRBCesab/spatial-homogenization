@@ -3,18 +3,22 @@ library(RVAideMemoire)
 library(cluster)
 library(clue)
 library(sf)
-library(ggplot)
+library(ggplot2)
 library(plyr)
 library(dplyr)
+library(terra)
+library(exactextractr)
+library(mgcv)
+library(gratia)
 
 # Load bird data
 
-bird_data <- readRDS("Documents/bioagora/output/bird_data_clean.rds")
+bird_data <- readRDS("data/bird_data_clean.rds")
 
 ### SFI
 
 # load trait-species matrix
-trait <- read.csv("Téléchargements/life_history_bird2.csv", header = TRUE)
+trait <- read.csv("data/life_history_bird2.csv", header = TRUE)
 
 # species name consistency
 trait$Species <- gsub("_", " ", trait$Species)
@@ -240,12 +244,12 @@ data_sai <- ddply(bird_data, .(sci_name_out), .fun = function(x) {
 
 # site location
 site_mainland_sf_reproj <- readRDS(
-  "Documents/bioagora/output/site_mainland_sf_reproj.rds"
+  "data/site_mainland_sf_reproj.rds"
 )
 
 # map of European countries involved in bird monitoring
 grid_eu_mainland_outline <- st_read(
-  "Documents/bioagora/output/grid_eu_mainland_outline.gpkg"
+  "data/grid_eu_mainland_outline.gpkg"
 )
 
 # get the max convex hull (i.e. mimic the case when a species was present in all site, to serve as a reference)
@@ -359,6 +363,8 @@ ggplot(sxi) +
 ggplot(sxi) +
   geom_point(aes(x = sri, y = sai))
 
+# write.csv(sxi,"outputs/sxi_bird.csv", row.names = FALSE)
+
 
 ### CWM community weighted mean by abundance and CM community mean for occurrence
 
@@ -399,3 +405,252 @@ ggplot(cwm_cm[which(cwm_cm$year == 2011), ]) +
   geom_point(aes(x = cm_sfi, y = cm_sai))
 ggplot(cwm_cm[which(cwm_cm$year == 2011), ]) +
   geom_point(aes(x = cm_sfi, y = cm_sri))
+
+# write.csv(cwm_cm,"outputs/community_indices_bird.csv", row.names = FALSE)
+
+### Explanatory variables
+
+#### HFI
+
+# load HFI data from Mu et al. 2022
+
+hfi2018 <- rast("data/hfp2018.tif")
+
+# crop and reproject hfi for Europe
+
+grid_eu_mainland_outline_moll <- st_transform(grid_eu_mainland_outline, st_crs(hfi2018))
+
+hfi2018_europe <- mask(hfi2018,grid_eu_mainland_outline_moll) # terrestrial cells
+
+hfi2018_europe <- crop(hfi2018_europe,ext(grid_eu_mainland_outline_moll)) # remove oversea territories
+
+hfi2018_europe_ETRS89 <- project(hfi2018_europe, "epsg:3035")
+
+# select a buffer around each monitoring site
+
+site_mainland_buffer <- st_buffer(site_mainland_sf_reproj, dist = 2500) # here a buffer with a 2.5km radius that can be changed
+
+# get average hfi in each buffer
+
+site_hfi <- exact_extract(hfi2018_europe_ETRS89,site_mainland_buffer, fun="mean")
+
+
+#### Climate
+
+# to download from https://www.chelsa-climate.org/datasets/chelsa_bioclim
+
+# reproject and crop for Europe
+
+for(i in c("01", # Mean annual temperature calculated as the average of mean monthly temperatures over the year
+           "04", # Temperature seasonality given by the standard deviation of mean monthly temperatures
+           "07", # Annual temperature range calculated as bio05 − bio06; measures amplitude between warmest and coldest months
+           "12", # Sum of monthly precipitation totals across the year
+           "15" # Coefficient of variation (100 × SD ÷ mean) of monthly precipitation totals
+           )){
+  
+  past <- rast(paste0("data/CHELSA_bio",i,"_1981-2010_V.2.1.tif"))
+  past <- terra::crop(past, grid_eu_mainland_outline_wgs84, snap="near", extend=FALSE)
+  past <- terra::project(past,crs(grid_eu_mainland_outline))
+  assign(paste0("bio",i,"_1981_2010_eu"),past)
+  writeRaster(x = past, 
+              filename = paste0("data/bio",i,"_1981_2010_eu.tif"),
+              overwrite = TRUE)
+}
+
+# load the new climate maps
+
+for(i in c("01","04","07","12","15")){
+  past <- rast(paste0("data/bio",i,"_1981_2010_eu.tif"))
+  past <- terra::mask(past,grid_eu_mainland_outline)
+  assign(paste0("bio",i,"_1981_2010_eu"),past)
+}
+
+# extract climate data within each buffer
+
+bio01_past <- exact_extract(bio01_1981_2010_eu,site_mainland_buffer, fun="mean") # Mean annual temperature calculated as the average of mean monthly temperatures over the year
+bio04_past <- exact_extract(bio04_1981_2010_eu,site_mainland_buffer) # Temperature seasonality given by the standard deviation of mean monthly temperatures
+bio04_past <- sqrt(laply(bio04_past, function(x){return(c(weighted.mean(x$value^2,w = x$coverage_fraction)))}))
+bio07_past <- exact_extract(bio07_1981_2010_eu,site_mainland_buffer, fun="mean") # Annual temperature range calculated as bio05 − bio06; measures amplitude between warmest and coldest months
+bio12_past <- exact_extract(bio12_1981_2010_eu,site_mainland_buffer, fun="mean") # Sum of monthly precipitation totals across the year
+bio15_past <- exact_extract(bio15_1981_2010_eu,site_mainland_buffer, fun="mean") # Coefficient of variation (100 × SD ÷ mean) of monthly precipitation totals
+
+### Analysis
+
+#### Prepare the dataset
+
+# combine response and explanatory variables
+
+site_mainland_buffer$hfi <- site_hfi
+site_mainland_buffer$bio01_past <- bio01_past
+site_mainland_buffer$bio04_past <- bio04_past
+site_mainland_buffer$bio07_past <- bio07_past
+site_mainland_buffer$bio12_past <- bio12_past
+site_mainland_buffer$bio15_past <- bio15_past
+
+site_mainland_buffer_nosf <- site_mainland_buffer # get an non spatial object
+st_geometry(site_mainland_buffer_nosf) <- NULL
+
+cwm_cm_hfi <- merge(cwm_cm,site_mainland_buffer_nosf,by="siteID", all.x=TRUE)
+
+# write.csv(cwm_cm_hfi,"outputs/community_indices_bird_with_covariates.csv", row.names = FALSE)
+
+# check correlation (bio04 and bio07 very similar, keep just bio07 as more easy to interpret)
+
+test_multicor <- round(cor(na.omit(site_mainland_buffer_nosf[,c("hfi","bio01_past","bio04_past","bio07_past","bio12_past","bio15_past")])), 3)
+get_upper_tri <- function(test_multicor) {
+  test_multicor[lower.tri(test_multicor)] <- NA
+  return(test_multicor)
+}
+test_multicor <- get_upper_tri(test_multicor)
+test_multicor <- reshape2::melt(test_multicor, na.rm = TRUE)
+ggplot(data = test_multicor, aes(Var2, Var1, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "blue",
+    high = "red",
+    mid = "white",
+    midpoint = 0,
+    limit = c(-1, 1),
+    space = "Lab",
+    name = "Pearson\nCorrelation"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, size = 12, hjust = 1),
+    axis.title = element_blank()
+  ) +
+  geom_text(aes(Var2, Var1, label = value), color = "black", size = 4) +
+  coord_fixed()
+
+#### Run the analysis
+
+# get a first look over the relationship
+
+ggplot(cwm_cm_hfi) +
+  geom_point(aes(y = cm_sfi, x=hfi))
+ggplot(cwm_cm_hfi) +
+  geom_point(aes(y = cm_sai, x=hfi))
+ggplot(cwm_cm_hfi) +
+  geom_point(aes(y = cm_sri, x=hfi))
+
+# check distribution of the response
+
+ggplot(cwm_cm_hfi) +
+  geom_histogram(aes(x = cm_sfi))
+ggplot(cwm_cm_hfi) +
+  geom_histogram(aes(x = cm_sai))
+ggplot(cwm_cm_hfi) +
+  geom_histogram(aes(x = cm_sri))
+
+# select just one year per site to avoid providing too much weight to site sampled several years and get independence between values
+
+cwm_cm_hfi_oneyearpersite <- ddply(
+  cwm_cm_hfi,
+  .(siteID),
+  .fun = function(x) {
+    set.seed(123) # for reproducibility
+    x_sample <- sample_n(x, 1)
+    
+    return(x_sample)
+  },
+  .progress = "text"
+)
+
+# write.csv(cwm_cm_hfi_oneyearpersite,"outputs/bird_data_to_run_analysis.csv", row.names = FALSE)
+
+##### SFI
+
+formula_gam <- "cm_sfi ~ s(hfi,k=4) + s(bio01_past,k=4) + s(bio07_past,k=4) + s(bio12_past,k=4) + s(bio15_past,k=4)"
+
+global_mod_sfi_gauss <- bam(as.formula(paste(formula_gam,sep=" + ",paste(c("area_sampled_m2", # area monitored, i.e. sampling effort, should explain part of the change across community
+                                                                           "te(Long_LAEA,Lat_LAEA,bs='tp',fx=TRUE,k=10)" # tensor product to handle spatial autocorrelation
+                                                                           ), collapse = " + "))),
+                  data=cwm_cm_hfi_oneyearpersite)
+
+summary(global_mod_sfi_gauss)
+gam.check(global_mod_sfi_gauss) # seems that variance is stable but gaussian assumptium not the best choice, res vs. fitted is fine
+plot(global_mod_sfi_gauss, residuals = TRUE) # almost linear increase (first plot) of sfi with hfi
+
+
+
+global_mod_sfi_gamma <- bam(as.formula(paste(formula_gam,sep=" + ",paste(c("area_sampled_m2","te(Long_LAEA,Lat_LAEA,bs='tp',fx=TRUE,k=10)"), collapse = " + "))),
+                            family=Gamma(link=log),data=cwm_cm_hfi_oneyearpersite)
+
+summary(global_mod_sfi_gamma)
+gam.check(global_mod_sfi_gamma) # no big improvement compare to gaussian -> stay with gaussian to start as more easy to interpret
+plot(global_mod_sfi_gamma, residuals = TRUE)
+
+# try with polynomials for hfi to interpret more easily the relationship SFI vs. HFI
+
+formula_gam <- "cm_sfi ~ hfi + I(hfi^2) + I(hfi^3) + s(bio01_past,k=4) + s(bio07_past,k=4) + s(bio12_past,k=4) + s(bio15_past,k=4)"
+
+global_mod_sfi_gauss <- bam(as.formula(paste(formula_gam,sep=" + ",paste(c("area_sampled_m2","te(Long_LAEA,Lat_LAEA,bs='tp',fx=TRUE,k=10)"), collapse = " + "))),
+                            data=cwm_cm_hfi_oneyearpersite)
+
+summary(global_mod_sfi_gauss)
+gam.check(global_mod_sfi_gauss)
+plot(global_mod_sfi_gauss, residuals = TRUE)
+
+ds <- data_slice(global_mod_sfi_gauss, hfi = evenly(hfi, n = 100))
+fv <- fitted_values(global_mod_sfi_gauss, data = ds)
+ggplot(fv,aes(x = hfi, y = .fitted)) +
+  geom_point(data = cwm_cm_hfi_oneyearpersite, mapping = aes(y = cm_sfi), size = 0.5) +
+  geom_function(fun = function(x){summary(global_mod_sfi_gauss)$p.coeff[1]+x*summary(global_mod_sfi_gauss)$p.coeff[2]+x^2*summary(global_mod_sfi_gauss)$p.coeff[3]+x^3*summary(global_mod_sfi_gauss)$p.coeff[4]}, colour = "blue", xlim=c(0,50))
+
+# there is a small decrease for very low of hfi, perhaps we can use exp or piecewise, to check
+
+
+##### SAI
+
+formula_gam <- "cm_sai ~ s(hfi,k=4) + s(bio01_past,k=4) + s(bio07_past,k=4) + s(bio12_past,k=4) + s(bio15_past,k=4)"
+
+global_mod_sai_gauss <- bam(as.formula(paste(formula_gam,sep=" + ",paste(c("area_sampled_m2","te(Long_LAEA,Lat_LAEA,bs='tp',fx=TRUE,k=10)"), collapse = " + "))),
+                            data=cwm_cm_hfi_oneyearpersite)
+
+summary(global_mod_sai_gauss)
+gam.check(global_mod_sai_gauss)
+plot(global_mod_sai_gauss, residuals = TRUE)
+
+
+formula_gam <- "cm_sai ~ hfi + I(hfi^2) + I(hfi^3) + s(bio01_past,k=4) + s(bio07_past,k=4) + s(bio12_past,k=4) + s(bio15_past,k=4)"
+
+global_mod_sai_gauss <- bam(as.formula(paste(formula_gam,sep=" + ",paste(c("area_sampled_m2","te(Long_LAEA,Lat_LAEA,bs='tp',fx=TRUE,k=10)"), collapse = " + "))),
+                            data=cwm_cm_hfi_oneyearpersite)
+
+summary(global_mod_sai_gauss)
+gam.check(global_mod_sai_gauss)
+plot(global_mod_sai_gauss, residuals = TRUE)
+
+ds <- data_slice(global_mod_sai_gauss, hfi = evenly(hfi, n = 100))
+fv <- fitted_values(global_mod_sai_gauss, data = ds)
+ggplot(fv,aes(x = hfi, y = .fitted)) +
+  geom_point(data = cwm_cm_hfi_oneyearpersite, mapping = aes(y = cm_sai), size = 0.5) +
+  geom_function(fun = function(x){summary(global_mod_sai_gauss)$p.coeff[1]+x*summary(global_mod_sai_gauss)$p.coeff[2]+x^2*summary(global_mod_sai_gauss)$p.coeff[3]+x^3*summary(global_mod_sai_gauss)$p.coeff[4]}, colour = "blue", xlim=c(0,50))
+
+# better fit with s(hfi), here also exp could be checked instead of poly
+
+formula_gam <- "cm_sri ~ s(hfi,k=4) + s(bio01_past,k=4) + s(bio07_past,k=4) + s(bio12_past,k=4) + s(bio15_past,k=4)"
+
+global_mod_sri_gauss <- bam(as.formula(paste(formula_gam,sep=" + ",paste(c("area_sampled_m2","te(Long_LAEA,Lat_LAEA,bs='tp',fx=TRUE,k=10)"), collapse = " + "))),
+                            data=cwm_cm_hfi_oneyearpersite)
+
+summary(global_mod_sri_gauss)
+gam.check(global_mod_sri_gauss)
+plot(global_mod_sri_gauss, residuals = TRUE)
+
+
+formula_gam <- "cm_sri ~ hfi + I(hfi^2) + I(hfi^3) + s(bio01_past,k=4) + s(bio07_past,k=4) + s(bio12_past,k=4) + s(bio15_past,k=4)"
+
+global_mod_sri_gauss <- bam(as.formula(paste(formula_gam,sep=" + ",paste(c("area_sampled_m2","te(Long_LAEA,Lat_LAEA,bs='tp',fx=TRUE,k=10)"), collapse = " + "))),
+                            data=cwm_cm_hfi_oneyearpersite)
+
+summary(global_mod_sri_gauss)
+gam.check(global_mod_sri_gauss)
+plot(global_mod_sri_gauss, residuals = TRUE)
+
+ds <- data_slice(global_mod_sri_gauss, hfi = evenly(hfi, n = 100))
+fv <- fitted_values(global_mod_sri_gauss, data = ds)
+ggplot(fv,aes(x = hfi, y = .fitted)) +
+  geom_point(data = cwm_cm_hfi_oneyearpersite, mapping = aes(y = cm_sri), size = 0.5) +
+  geom_function(fun = function(x){summary(global_mod_sri_gauss)$p.coeff[1]+x*summary(global_mod_sri_gauss)$p.coeff[2]+x^2*summary(global_mod_sri_gauss)$p.coeff[3]+x^3*summary(global_mod_sri_gauss)$p.coeff[4]}, colour = "blue", xlim=c(0,50))
+
